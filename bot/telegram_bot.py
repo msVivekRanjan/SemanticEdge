@@ -35,9 +35,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = resp.json()
             
             zone_info = "\n".join([f"- {z}: {c}" for z, c in data.get("zone_counts", {}).items()])
-            msg = f"📊 **Stats**\nTotal Events: {data.get('total_events', 0)}\nUnique Persons: {data.get('unique_persons', 0)}\nZones:\n{zone_info}"
+            msg = f"📊 Stats\nTotal Events: {data.get('total_events', 0)}\nUnique Persons: {data.get('unique_persons', 0)}\nZones:\n{zone_info}"
             
-            await update.message.reply_text(msg, parse_mode="Markdown")
+            await update.message.reply_text(msg)
     except Exception as e:
         await update.message.reply_text(f"Failed to fetch stats: {e}")
 
@@ -77,24 +77,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_query(update, query_text)
 
 async def handle_query(update: Update, query_text: str):
-    await update.message.reply_text(f"🔍 Searching: '{query_text}'...")
+    msg = await update.message.reply_text(f"🔍 Analyzing: '{query_text}'...")
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(f"{BACKEND_URL}/search", json={"query": query_text})
-            results = resp.json()
             
-            if not results:
-                await update.message.reply_text("No relevant events found.")
+            if resp.status_code != 200:
+                await msg.edit_text(f"Backend error ({resp.status_code}): {resp.text}")
                 return
                 
-            msgs = []
-            for r in results:
-                time_part = r.get("timestamp", "").split("T")[-1].split(".")[0] if "T" in r.get("timestamp", "") else r.get("timestamp")
-                msgs.append(f"📍 Zone: {r.get('zone')} | 🕐 {time_part} | 👤 {r.get('objects')}")
+            data = resp.json()
+            
+            if isinstance(data, dict) and "response" in data:
+                text_response = data["response"]
+                frame_path = data.get("frame_path")
                 
-            await update.message.reply_text("\n".join(msgs))
+                await msg.edit_text(text_response)
+                
+                if frame_path:
+                    try:
+                        img_resp = await client.get(f"{BACKEND_URL}/frame", params={"path": frame_path})
+                        if img_resp.status_code == 200:
+                            await update.message.reply_photo(photo=img_resp.content, caption="Visual Confirmation")
+                    except Exception as e:
+                        print(f"Failed to fetch image: {e}")
+            else:
+                await msg.edit_text(f"Database returned an unexpected format: {data}")
     except Exception as e:
-        await update.message.reply_text(f"Search failed: {e}")
+        await msg.edit_text(f"Search failed: {e}")
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")

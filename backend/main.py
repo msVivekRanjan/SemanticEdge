@@ -1,19 +1,54 @@
 import os
 import json
 import asyncio
-from typing import List, Dict, Any
+import urllib.parse
+from typing import List
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import chromadb
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+from fastapi.responses import FileResponse
 
 from alert_engine import check_alerts
+from nlq import route_query, generate_response
 
 load_dotenv()
 
-app = FastAPI(title="SemanticEdge 5G Backend")
+# --- LIFESPAN MANAGER (Replaces startup/shutdown events) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Securely parse MongoDB URI
+    raw_uri = os.getenv("MONGO_URI")
+    
+    # If your URI contains 'username:password@cluster', let's ensure it's safe.
+    # Note: If your .env already has the full escaped URI, you can use it directly.
+    # Otherwise, it's safer to build it or escape the credentials as shown below:
+    # user = urllib.parse.quote_plus(os.getenv("DB_USER"))
+    # pw = urllib.parse.quote_plus(os.getenv("DB_PASS"))
+    
+    app.db_client = AsyncIOMotorClient(raw_uri)
+    app.db = app.db_client.semanticedge
+    
+    # 2. ChromaDB Setup
+    app.chroma_client = chromadb.Client()
+    app.chroma_collection = app.chroma_client.get_or_create_collection(name="semantic_events")
+    
+    # 3. Sentence Transformer
+    app.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    print("Startup complete: Services initialized.")
+    yield
+    
+    # 4. Shutdown Logic
+    app.db_client.close()
+    print("Shutdown complete: Connections closed.")
+
+# --- APP INITIALIZATION ---
+app = FastAPI(title="SemanticEdge 5G Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,13 +57,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Global clients
-db_client = None
-db = None
-chroma_client = None
-chroma_collection = None
-embedder = None
 
 class ConnectionManager:
     def __init__(self):
@@ -51,29 +79,16 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-@app.on_event("startup")
-async def startup_event():
-    global db_client, db, chroma_client, chroma_collection, embedder
-    
-    # MongoDB
-    mongo_uri = os.getenv("MONGO_URI")
-    db_client = AsyncIOMotorClient(mongo_uri)
-    db = db_client.semanticedge
-    
-    # ChromaDB
-    chroma_client = chromadb.Client()
-    chroma_collection = chroma_client.get_or_create_collection(name="semantic_events")
-    
-    # Sentence Transformer
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    db_client.close()
+# --- ROUTES ---
 
 @app.post("/events")
 async def receive_event(request: Request):
     event = await request.json()
+    
+    # Access state via app instance instead of globals
+    db = request.app.db
+    embedder = request.app.embedder
+    chroma_collection = request.app.chroma_collection
     
     # MongoDB Insert
     result = await db.events.insert_one(event)
@@ -92,84 +107,146 @@ async def receive_event(request: Request):
         documents=[summary]
     )
     
-    # Alert Engine
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
-    # We fire and forget the alert check
     asyncio.create_task(check_alerts(event, bot_token, chat_id))
-    
-    # WebSocket Broadcast
     await manager.broadcast(json.dumps(event))
     
     return {"status": "ok"}
 
 @app.get("/events")
-async def get_events():
-    cursor = db.events.find().sort("timestamp", -1).limit(50)
-    events = []
-    async for document in cursor:
-        document['_id'] = str(document['_id'])
-        events.append(document)
-    return events
+async def get_events(request: Request):
+    try:
+        cursor = request.app.db.events.find().sort("timestamp", -1).limit(50)
+        events = []
+        async for document in cursor:
+            document['_id'] = str(document['_id'])
+            events.append(document)
+        return events
+    except Exception as e:
+        print(f"MongoDB Error in /events: {e}")
+        return []
 
 @app.get("/stats")
-async def get_stats():
-    # Zone counts
-    pipeline = [
-        {"$group": {"_id": "$zone", "count": {"$sum": 1}}}
-    ]
-    zone_counts = {}
-    async for doc in db.events.aggregate(pipeline):
-        zone_counts[doc["_id"]] = doc["count"]
+async def get_stats(request: Request):
+    try:
+        # Zone counts
+        db = request.app.db
+        pipeline = [
+            {"$group": {"_id": "$zone", "count": {"$sum": 1}}}
+        ]
+        zone_counts = {}
+        async for doc in db.events.aggregate(pipeline):
+            zone_counts[doc["_id"]] = doc["count"]
+            
+        # Unique Track IDs
+        unique_tracks = await db.events.distinct("track_id")
         
-    # Unique Track IDs
-    unique_tracks = await db.events.distinct("track_id")
-    
-    # Total count
-    total_count = await db.events.count_documents({})
-    
-    return {
-        "zone_counts": zone_counts,
-        "unique_persons": len([t for t in unique_tracks if t != -1]),
-        "total_events": total_count
-    }
+        # Total count
+        total_count = await db.events.count_documents({})
+        
+        return {
+            "zone_counts": zone_counts,
+            "unique_persons": len([t for t in unique_tracks if t != -1]),
+            "total_events": total_count
+        }
+    except Exception as e:
+        print(f"MongoDB Error in /stats: {e}")
+        return {
+            "zone_counts": {},
+            "unique_persons": 0,
+            "total_events": 0,
+            "error": "Database Connection Failed (Check MongoDB IP Allowlist)"
+        }
 
 @app.post("/search")
 async def search_events(request: Request):
-    data = await request.json()
-    query = data.get("query", "")
-    
-    if not query:
-        return []
+    try:
+        data = await request.json()
+        query = data.get("query", "")
         
-    query_embedding = embedder.encode(query).tolist()
-    results = chroma_collection.query(
-        query_embeddings=[query_embedding],
-        n_results=5
-    )
-    
-    parsed_results = []
-    if results['ids']:
-        for i in range(len(results['ids'][0])):
-            parsed_results.append({
-                "timestamp": results['ids'][0][i],
-                "zone": results['metadatas'][0][i].get("zone", ""),
-                "objects": results['metadatas'][0][i].get("objects", "")
-            })
+        if not query:
+            return {"response": "Please provide a query."}
             
-    return parsed_results
+        # 1. Route the query using LLM
+        plan = await route_query(query)
+        
+        if not isinstance(plan, dict):
+            return {"response": f"Failed to plan query. Unexpected output type: {type(plan)}"}
+            
+        if "error" in plan:
+            return {"response": f"Failed to plan query: {plan['error']}"}
+            
+        db_results = []
+        engine = plan.get("engine")
+        
+        if not engine:
+            return {"response": "Failed to determine search engine (mongo vs chroma)."}
+        
+        # 2. Fetch data
+        if engine == "mongo":
+            pipeline = plan.get("pipeline", [])
+            # Always limit to prevent massive payload
+            if not any("$limit" in stage for stage in pipeline):
+                pipeline.append({"$limit": 50})
+                
+            cursor = request.app.db.events.aggregate(pipeline)
+            async for doc in cursor:
+                doc['_id'] = str(doc['_id'])
+                db_results.append(doc)
+                
+        elif engine == "chroma":
+            search_text = plan.get("search_text", query)
+            query_embedding = request.app.embedder.encode(search_text).tolist()
+            chroma_res = request.app.chroma_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=5
+            )
+            
+            # Map chroma results
+            if chroma_res["ids"] and len(chroma_res["ids"][0]) > 0:
+                for i in range(len(chroma_res['ids'][0])):
+                    db_results.append({
+                        "timestamp": chroma_res['ids'][0][i],
+                        "zone": chroma_res['metadatas'][0][i].get("zone", ""),
+                        "objects": chroma_res['metadatas'][0][i].get("objects", "")
+                    })
+                    
+        # 3. Generate Natural Language Response
+        final_answer = await generate_response(query, db_results)
+        
+        # 4. Attach image if requested/available
+        best_frame = None
+        for res in db_results:
+            if "frame_path" in res and res["frame_path"] and os.path.exists(res["frame_path"]):
+                best_frame = res["frame_path"]
+                break
+                
+        return {
+            "response": final_answer,
+            "raw_results": len(db_results),
+            "frame_path": best_frame
+        }
+    except Exception as e:
+        print(f"Error in /search: {e}")
+        return {"response": f"An error occurred: {str(e)}"}
+
+@app.get("/frame")
+async def get_frame(path: str):
+    if not path or not os.path.exists(path):
+        return {"error": "Frame not found"}
+    return FileResponse(path)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
-            # keep-alive or just ignore incoming
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

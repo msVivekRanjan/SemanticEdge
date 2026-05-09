@@ -6,14 +6,42 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SYSTEM_PROMPT = """You are a query translator. Convert the user's natural language question about surveillance events into a MongoDB filter dict. Events have fields: cam_id (string), timestamp (ISO string), zone (string: entrance or aisle), objects (array of objects with type, confidence). Return ONLY valid JSON dict, no explanation."""
+ROUTER_PROMPT = """You are the AI brain for a privacy-first video surveillance system.
+You receive natural language queries from security operators and must decide how to fetch the data.
 
-async def query_to_filter(natural_language_query: str) -> dict:
+You have two database tools:
+1. "mongo": Use this for exact metadata matches, counts, or timeframe queries.
+   (e.g., "How many unique persons?", "How many cars passed between 9am and 12pm?", "Any person in the entrance?")
+2. "chroma": Use this for semantic visual/fuzzy searches.
+   (e.g., "Did a white SUV pass by?", "Red backpack", "Black color shirt male")
+
+Respond ONLY with a JSON object.
+Format for "mongo":
+{"engine": "mongo", "pipeline": [<MongoDB Aggregation Pipeline Array>]}
+Format for "chroma":
+{"engine": "chroma", "search_text": "The exact visual description to search for"}
+
+Events collection schema:
+- cam_id (string)
+- timestamp (ISO 8601 string, e.g. '2023-10-27T10:00:00Z')
+- zone (string: 'entrance' or 'aisle')
+- track_id (int)
+- objects (array of dicts: {type: string, confidence: float, bbox: [x,y,x,y]})
+- frame_path (string)
+"""
+
+RESPONSE_PROMPT = """You are an AI surveillance assistant. 
+You are given the operator's original question and the raw JSON results returned by the database.
+Your job is to answer the operator's question in a clear, concise, and helpful natural language format.
+Be brief. Highlight key details like timestamps, zones, and confidence scores. 
+If the database results are empty, say so politely.
+If there is a frame available, mention it (the bot will attach it automatically)."""
+
+async def route_query(natural_language_query: str) -> dict:
     try:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
-            print("Warning: ANTHROPIC_API_KEY not set")
-            return {}
+            return {"error": "ANTHROPIC_API_KEY not set"}
 
         llm = ChatAnthropic(
             model="claude-3-5-haiku-20241022",
@@ -22,27 +50,53 @@ async def query_to_filter(natural_language_query: str) -> dict:
         )
         
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=ROUTER_PROMPT),
             HumanMessage(content=natural_language_query)
         ]
         
         response = await llm.ainvoke(messages)
         content = response.content.strip()
         
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.endswith("```"):
-            content = content[:-3]
-            
+        # Robust JSON extraction
+        import re
+        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+        if json_match:
+            content = json_match.group(1)
+        elif content.startswith("{") and content.endswith("}"):
+            pass # Already JSON
+        else:
+            # Fallback string matching
+            start_idx = content.find('{')
+            end_idx = content.rfind('}')
+            if start_idx != -1 and end_idx != -1:
+                content = content[start_idx:end_idx+1]
+                
         return json.loads(content.strip())
-        
     except Exception as e:
-        print(f"Failed to parse NLQ to MongoDB filter: {e}")
-        return {}
+        print(f"Failed to route query: {e}")
+        return {"error": str(e)}
 
-if __name__ == "__main__":
-    import asyncio
-    query = "Show me all people in the entrance zone"
-    filter_dict = asyncio.run(query_to_filter(query))
-    print(f"Query: {query}")
-    print(f"Filter: {json.dumps(filter_dict, indent=2)}")
+async def generate_response(query: str, db_results: list) -> str:
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            return str(db_results)
+
+        llm = ChatAnthropic(
+            model="claude-3-5-haiku-20241022",
+            anthropic_api_key=api_key,
+            temperature=0
+        )
+        
+        context = f"Operator Question: {query}\n\nDatabase JSON Results:\n{json.dumps(db_results, indent=2)}"
+        
+        messages = [
+            SystemMessage(content=RESPONSE_PROMPT),
+            HumanMessage(content=context)
+        ]
+        
+        response = await llm.ainvoke(messages)
+        return response.content.strip()
+    except Exception as e:
+        print(f"Failed to generate natural response: {e}")
+        return "Failed to generate a readable response from database results."
