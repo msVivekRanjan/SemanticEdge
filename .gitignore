@@ -1,7 +1,23 @@
-.env/
+# Environment
+.env
 venv/
-**/node_modules/
-**/__pycache__/
-**/frames/
-**/*.db/ 
-yolo11s.pt
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# AI Models
+*.pt
+*.pth
+
+# Databases
+*.db
+
+# Generated frames
+frames/
+
+# macOS
+.DS_Store
