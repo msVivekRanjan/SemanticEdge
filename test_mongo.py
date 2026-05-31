@@ -5,10 +5,10 @@ from dotenv import load_dotenv
 load_dotenv()
 async def test():
     uri = os.getenv("MONGO_URI")
-    client = AsyncIOMotorClient(uri, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+    client = AsyncIOMotorClient(uri, tls=True, tlsAllowInvalidCertificates=True, serverSelectionTimeoutMS=5000)
     try:
         await client.admin.command('ping')
-        print("Connected successfully")
+        print("Connected successfully with tlsAllowInvalidCertificates=True")
     except Exception as e:
         print(f"Error: {e}")
     client.close()
