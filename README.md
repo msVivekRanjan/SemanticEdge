@@ -2,6 +2,8 @@
 
 A privacy-first AI surveillance system prototype that converts video to structured metadata at the edge and never uploads raw footage to the cloud.
 
+![SemanticEdge](dashboard/public/4.png)
+
 ## Project Structure
 - `edge/`: Video inference pipeline running locally.
 - `backend/`: FastAPI backend handling MongoDB, ChromaDB vector store, WebSockets, and Alert checking.

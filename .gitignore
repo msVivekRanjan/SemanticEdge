@@ -4,3 +4,4 @@ venv/
 **/__pycache__/
 **/frames/
 **/*.db/ 
+yolo11s.pt

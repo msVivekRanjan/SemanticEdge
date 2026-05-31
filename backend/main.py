@@ -30,7 +30,13 @@ async def lifespan(app: FastAPI):
     # user = urllib.parse.quote_plus(os.getenv("DB_USER"))
     # pw = urllib.parse.quote_plus(os.getenv("DB_PASS"))
     
-    app.db_client = AsyncIOMotorClient(raw_uri)
+    try:
+        app.db_client = AsyncIOMotorClient(raw_uri, serverSelectionTimeoutMS=5000)
+        # Verify connection
+        await app.db_client.admin.command('ping')
+        print("MongoDB connected")
+    except Exception as e:
+        print(f"MongoDB connection failed: {e}")
     app.db = app.db_client.semanticedge
     
     # 2. ChromaDB Setup
@@ -83,6 +89,7 @@ manager = ConnectionManager()
 
 @app.post("/events")
 async def receive_event(request: Request):
+    print("[BACKEND] Event received")
     event = await request.json()
     
     # Access state via app instance instead of globals
@@ -91,11 +98,21 @@ async def receive_event(request: Request):
     chroma_collection = request.app.chroma_collection
     
     # MongoDB Insert
-    result = await db.events.insert_one(event)
-    event['_id'] = str(result.inserted_id)
+    try:
+        result = await db.events.insert_one(event)
+        event['_id'] = str(result.inserted_id)
+        print("[BACKEND] MongoDB insert success")
+    except Exception as e:
+        import traceback
+        print(f"[BACKEND] MongoDB insert failed: {e}")
+        traceback.print_exc()
     
     # Create text summary and embed in ChromaDB
-    objects_str = ' '.join([o.get('type', '') for o in event.get('objects', [])])
+    objects_desc = []
+    for o in event.get('objects', []):
+        attrs = " ".join([f"{k}:{v}" for k, v in o.get('attributes', {}).items()])
+        objects_desc.append(f"{o.get('type', '')} {attrs}".strip())
+    objects_str = ' '.join(objects_desc)
     summary = f"Zone: {event.get('zone', '')}. Objects detected: {objects_str}."
     
     embedding = embedder.encode(summary).tolist()
@@ -185,7 +202,10 @@ async def search_events(request: Request):
             return {"response": "Failed to determine search engine (mongo vs chroma)."}
         
         # 2. Fetch data
-        if engine == "mongo":
+        if engine == "needs_date":
+            return {"response": plan.get("reason", "Please provide a specific date or time range to narrow down the search.")}
+            
+        elif engine == "mongo":
             pipeline = plan.get("pipeline", [])
             # Always limit to prevent massive payload
             if not any("$limit" in stage for stage in pipeline):
@@ -207,10 +227,17 @@ async def search_events(request: Request):
             # Map chroma results
             if chroma_res["ids"] and len(chroma_res["ids"][0]) > 0:
                 for i in range(len(chroma_res['ids'][0])):
+                    ts = chroma_res['ids'][0][i]
+                    # We need the mongo _id for fetching the frame
+                    mongo_doc = await request.app.db.events.find_one({"timestamp": ts})
+                    doc_id = str(mongo_doc['_id']) if mongo_doc else ts
+                    
                     db_results.append({
-                        "timestamp": chroma_res['ids'][0][i],
+                        "_id": doc_id,
+                        "timestamp": ts,
                         "zone": chroma_res['metadatas'][0][i].get("zone", ""),
-                        "objects": chroma_res['metadatas'][0][i].get("objects", "")
+                        "objects": chroma_res['metadatas'][0][i].get("objects", ""),
+                        "frame_path": mongo_doc.get("frame_path") if mongo_doc else None
                     })
                     
         # 3. Generate Natural Language Response
@@ -243,7 +270,26 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text()
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("action") == "fetch":
+                    doc_id = msg.get("id")
+                    if doc_id:
+                        from bson.objectid import ObjectId
+                        # Check MongoDB for the document
+                        if ObjectId.is_valid(doc_id):
+                            doc = await websocket.app.db.events.find_one({"_id": ObjectId(doc_id)})
+                            if doc and doc.get("frame_path") and os.path.exists(doc["frame_path"]):
+                                import base64
+                                with open(doc["frame_path"], "rb") as f:
+                                    b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                await websocket.send_json({"action": "fetch_response", "id": doc_id, "image": b64_img})
+                                continue
+                        
+                    await websocket.send_json({"action": "fetch_error", "error": "Frame not found or invalid ID"})
+            except Exception as e:
+                print(f"WS Parsing error: {e}")
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 

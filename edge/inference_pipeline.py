@@ -1,4 +1,6 @@
 import os
+import sys
+import shutil
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -11,20 +13,18 @@ import httpx
 import asyncio
 import sqlite3
 import threading
+import queue
 from datetime import datetime, timezone
 import numpy as np
 from dotenv import load_dotenv
 import supervision as sv
 
-try:
-    from rfdetr import RFDETRBase
-except ImportError:
-    print("Warning: rfdetr not installed or not found. Please ensure it is installed.")
-    RFDETRBase = None
-
+from ultralytics import YOLO
 import base64
-from transformers import BlipProcessor, BlipForConditionalGeneration
 from PIL import Image
+import torch
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 load_dotenv()
 
@@ -32,6 +32,22 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "local_buffer.db")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/events")
 FRAMES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frames"))
 os.makedirs(FRAMES_DIR, exist_ok=True)
+
+def reset_storage():
+    print("Resetting local storage for demo...")
+    if os.path.exists(DB_PATH):
+        try:
+            os.remove(DB_PATH)
+            print("Deleted old local_buffer.db")
+        except Exception as e:
+            print(f"Failed to delete DB: {e}")
+    if os.path.exists(FRAMES_DIR):
+        try:
+            shutil.rmtree(FRAMES_DIR)
+            print("Deleted old frames directory")
+        except Exception as e:
+            print(f"Failed to delete frames: {e}")
+    os.makedirs(FRAMES_DIR, exist_ok=True)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -52,6 +68,8 @@ def save_event_locally(event_dict):
     cursor.execute("INSERT INTO events (payload, sent) VALUES (?, 0)", (json.dumps(event_dict),))
     conn.commit()
     conn.close()
+    print("[EVENT] Saved locally")
+    print(f"[LOCAL] Saved to buffer for Tracker ID: {event_dict.get('track_id', 'unknown')}")
 
 def retry_worker():
     while True:
@@ -69,7 +87,7 @@ def retry_worker():
                         cursor.execute("UPDATE events SET sent = 1 WHERE id = ?", (row_id,))
                         conn.commit()
                 except Exception as e:
-                    pass # Keep trying next time
+                    pass
             conn.close()
         except Exception as e:
             print(f"Retry worker error: {e}")
@@ -77,100 +95,187 @@ def retry_worker():
         time.sleep(30)
 
 async def send_event(event_dict):
+    import traceback
     try:
+        print("[EVENT] Sending")
         async with httpx.AsyncClient() as client:
             resp = await client.post(BACKEND_URL, json=event_dict, timeout=5.0)
             if resp.status_code != 200:
+                print(f"[EVENT] Backend failed with status {resp.status_code}. Saving locally.")
                 save_event_locally(event_dict)
-    except Exception:
+            else:
+                print("[EVENT] Sent")
+                print(f"[EVENT] Sent remotely for Tracker ID: {event_dict['track_id']}")
+    except Exception as e:
+        print(f"[EVENT] Backend failed with error: {e}. Saving locally.")
+        traceback.print_exc()
         save_event_locally(event_dict)
 
-description_cache = {}
+track_memory = {}
 pending_descriptions = set()
 logged_track_ids = set()
 
-blip_processor = None
-blip_model = None
+qwen_processor = None
+qwen_model = None
 
-def init_blip():
-    global blip_processor, blip_model
+def init_qwen():
+    global qwen_processor, qwen_model
     try:
-        print("Loading local BLIP model... (this may take a moment)")
-        blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-        print("Offline BLIP model loaded successfully.")
+        print("Loading local Qwen2.5-VL model... (this may take a moment)")
+        model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
+        qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id, 
+            torch_dtype=torch.bfloat16, 
+            device_map="auto"
+        )
+        qwen_processor = AutoProcessor.from_pretrained(model_id)
+        print("Offline Qwen model loaded successfully.")
     except Exception as e:
-        print(f"Failed to load BLIP model: {e}")
+        import traceback
+        print(f"Failed to load Qwen model: {e}")
+        traceback.print_exc()
 
-def fetch_description(track_id, cropped_image):
+def fetch_description(track_id, class_name, cropped_image, base_event_dict):
+    import traceback
+    start_time = time.time()
+    print("[QWEN] Started")
+    print(f"[QWEN] Started for tracker {track_id}")
     try:
-        if blip_model is None or blip_processor is None:
-            description_cache[track_id] = "person"
-            return
+        if qwen_model is None or qwen_processor is None:
+            desc = f"A {class_name}"
+        else:
+            rgb_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(rgb_image)
             
-        rgb_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(rgb_image)
+            prompt = f"Describe this {class_name}'s appearance, any carried objects, and their immediate surroundings/activity naturally. Be concise."
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": pil_image},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            
+            text = qwen_processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+            inputs = qwen_processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(qwen_model.device)
+            print(f"[QWEN] Input prepared for tracker {track_id}")
+
+            print(f"[QWEN] Generate started for tracker {track_id}")
+            generated_ids = qwen_model.generate(**inputs, max_new_tokens=25)
+            print(f"[QWEN] Generate completed for tracker {track_id}")
+            
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            desc = qwen_processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0].strip()
+            
+        print(f"[QWEN OUTPUT] {desc}")
+        elapsed = time.time() - start_time
+        print(f"Qwen inference time: {elapsed:.2f} seconds")
         
-        inputs = blip_processor(pil_image, return_tensors="pt")
-        out = blip_model.generate(**inputs)
-        description = blip_processor.decode(out[0], skip_special_tokens=True)
+        # Append rich description and fire event
+        print(f"[QWEN] Completed for tracker {track_id}:\n{desc}")
+        base_event_dict["objects"][0]["attributes"] = {"description": desc}
+        track_memory[track_id]["description"] = desc
+        print(f"[EVENT] Sending for Tracker ID {track_id}")
+        asyncio.run(send_event(base_event_dict))
+        logged_track_ids.add(track_id)
         
-        description_cache[track_id] = description.strip()
     except Exception as e:
-        print(f"Vision error: {e}")
-        description_cache[track_id] = "person"
+        print(f"[QWEN] Fatal error during inference for tracker {track_id}: {e}")
+        traceback.print_exc()
+        base_event_dict["objects"][0]["attributes"] = {"description": f"A {class_name}"}
+        track_memory[track_id]["description"] = f"A {class_name}"
+        asyncio.run(send_event(base_event_dict))
+        logged_track_ids.add(track_id)
     finally:
         pending_descriptions.discard(track_id)
 
+class CameraThread:
+    def __init__(self, src):
+        self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened() and isinstance(src, int):
+            self.cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
+        self.q = queue.Queue(maxsize=2)
+        self.running = True
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            if not self.q.empty():
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    pass
+            self.q.put(frame)
+
+    def read(self):
+        try:
+            return True, self.q.get(timeout=2.0)
+        except queue.Empty:
+            return False, None
+
+    def release(self):
+        self.running = False
+        self.thread.join()
+        self.cap.release()
+        
+    def isOpened(self):
+        return self.cap.isOpened()
+
 def run_pipeline():
+    if "--reset" in sys.argv:
+        reset_storage()
+
     init_db()
-    init_blip()
+    init_qwen()
     
-    # Start retry worker thread
     threading.Thread(target=retry_worker, daemon=True).start()
 
-    model = None
-    if RFDETRBase:
-        print("Loading RFDETR model...")
-        model = RFDETRBase()
-        if hasattr(model, 'optimize_for_inference'):
-            try:
-                model.optimize_for_inference()
-            except Exception:
-                pass
+    print("Loading YOLOv11s model...")
+    try:
+        model = YOLO("yolo11s.pt")
         print("Model loaded. Running warmup...")
         dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-        _ = model.predict(dummy)
+        _ = model.predict(dummy, verbose=False)
         print("Warmup complete.")
-    else:
-        print("Model not loaded, bounding boxes will not be generated.")
+    except Exception as e:
+        print(f"Failed to load YOLO: {e}")
+        model = None
 
     camera_source = os.getenv("CAMERA_SOURCE", "0")
     if camera_source.isdigit():
         camera_source = int(camera_source)
 
     print(f"Opening camera source: {camera_source}")
-    cap = cv2.VideoCapture(camera_source) # Rely on default backend
-    
-    # macOS fallback
-    if not cap.isOpened() and isinstance(camera_source, int):
-        print("Default backend failed, trying CAP_AVFOUNDATION...")
-        cap = cv2.VideoCapture(camera_source, cv2.CAP_AVFOUNDATION)
+    cap = CameraThread(camera_source)
 
     if not cap.isOpened():
-        print(f"ERROR: Cannot open camera source: {camera_source}. Please check connections and permissions.")
+        print(f"ERROR: Cannot open camera source: {camera_source}.")
         return
 
-    # Read one frame to get dimensions
-    ret, frame = False, None
-    for _ in range(10):
-        ret, frame = cap.read()
-        if ret:
-            break
-        time.sleep(0.2)
-
-    if not ret:
-        print("Failed to read a valid frame from the camera. The feed might be black or unavailable.")
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print("Failed to read a valid frame from the camera.")
         cap.release()
         return
 
@@ -178,61 +283,34 @@ def run_pipeline():
     print(f"Camera successfully opened. Resolution: {width}x{height}")
 
     cv2.namedWindow("SemanticEdge 5G", cv2.WINDOW_NORMAL)
-
     box_annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
-    
     tracker = sv.ByteTrack()
-
-    frame_count = 0
 
     while True:
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame is None:
             print("Warning: Failed to grab frame from feed.")
             break
-
-        frame_count += 1
         
-        # We always create annotated_frame to display it smoothly
         annotated_frame = frame.copy()
         
-        # Sample every 6th frame for inference
-        if frame_count % 6 == 0 and model:
+        if model:
             try:
-                results = model.predict(frame)
-                
-                # Check how results are structured and parse to sv.Detections
-                if isinstance(results, sv.Detections):
-                    detections = results
-                elif isinstance(results, list) and len(results) > 0 and isinstance(results[0], sv.Detections):
-                    detections = results[0]
-                elif hasattr(results, 'boxes'):
-                    detections = sv.Detections.from_ultralytics(results)
-                elif isinstance(results, list) and len(results) > 0 and hasattr(results[0], 'boxes'):
-                    detections = sv.Detections.from_ultralytics(results[0])
-                else:
-                    detections = sv.Detections.empty()
+                # Basic classes to keep it robust for demo, added confidence threshold 0.55
+                results = model.predict(frame, conf=0.55, classes=[0, 1, 2, 3, 5, 7, 15, 16, 24, 26, 28], verbose=False)
+                detections = sv.Detections.from_ultralytics(results[0])
             except Exception as e:
-                # If there's a prediction error (like out of bounds class_id), mock empty detections
                 detections = sv.Detections.empty()
 
-            # Filter out invalid class_ids (e.g., > 80 mapping to empty string)
             if detections is not None and len(detections) > 0:
-                valid_mask = []
-                for class_id in detections.class_id:
-                    if class_id is None:
-                        valid_mask.append(False)
-                    else:
-                        # Depending on the model, MS COCO has 80 classes usually (0 to 79)
-                        valid_mask.append(0 <= class_id < 80)
+                valid_mask = [(0 <= cid < 80) if cid is not None else False for cid in detections.class_id]
                 detections = detections[valid_mask]
 
-            # Update tracker
             detections = tracker.update_with_detections(detections)
 
             labels = []
-            events_to_send = []
+            current_time_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
             for i in range(len(detections)):
                 xyxy = detections.xyxy[i].tolist()
@@ -240,72 +318,64 @@ def run_pipeline():
                 class_id = int(detections.class_id[i]) if detections.class_id is not None else 0
                 tracker_id = int(detections.tracker_id[i]) if detections.tracker_id is not None else -1
                 
-                # Fetch rich description if not cached
-                class_name = "person" if class_id == 0 else f"class_{class_id}"
+                class_name = model.names[class_id] if model and hasattr(model, 'names') and class_id in model.names else f"class_{class_id}"
+                
                 if tracker_id != -1:
-                    if tracker_id in description_cache:
-                        class_name = description_cache[tracker_id]
+                    # Tracker Memory Update
+                    if tracker_id not in track_memory:
+                        print(f"[TRACK] New tracker {tracker_id}")
+                        track_memory[tracker_id] = {"first_seen": current_time_str, "last_seen": current_time_str}
+                    else:
+                        track_memory[tracker_id]["last_seen"] = current_time_str
+
+                    if tracker_id not in logged_track_ids and tracker_id not in pending_descriptions:
+                        event_id = f"evt_{int(time.time()*1000)}_{tracker_id}"
+                        frame_filename = f"{event_id}.jpg"
+                        frame_path = os.path.abspath(os.path.join(FRAMES_DIR, frame_filename))
+                        cv2.imwrite(frame_path, annotated_frame)
                         
-                        # DEBOUNCING: Only log once per tracker_id
-                        if tracker_id not in logged_track_ids:
-                            logged_track_ids.add(tracker_id)
-                            
-                            event_id = f"evt_{int(time.time()*1000)}_{i}"
-                            frame_filename = f"{event_id}.jpg"
-                            frame_path = os.path.abspath(os.path.join(FRAMES_DIR, frame_filename))
-                            
-                            event_dict = {
-                                "cam_id": "CAM_01",
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "zone": "whole_frame",
-                                "track_id": tracker_id,
-                                "objects": [
-                                    {
-                                        "type": class_name,
-                                        "confidence": confidence,
-                                        "bbox": xyxy
-                                    }
-                                ],
-                                "frame_path": frame_path
-                            }
-                            events_to_send.append(event_dict)
-                            
-                    elif tracker_id not in pending_descriptions:
-                        # Crop and send to LLM
+                        base_event_dict = {
+                            "cam_id": "CAM_01",
+                            "timestamp": current_time_str,
+                            "zone": "entrance",
+                            "track_id": tracker_id,
+                            "first_seen": track_memory[tracker_id]["first_seen"],
+                            "last_seen": track_memory[tracker_id]["last_seen"],
+                            "objects": [
+                                {
+                                    "type": class_name,
+                                    "confidence": confidence,
+                                    "attributes": {},
+                                    "bbox": xyxy
+                                }
+                            ],
+                            "frame_path": frame_path
+                        }
+                        
                         x1, y1, x2, y2 = map(int, xyxy)
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(width, x2), min(height, y2)
+                        
                         if x2 > x1 and y2 > y1:
                             cropped = frame[y1:y2, x1:x2]
                             pending_descriptions.add(tracker_id)
-                            threading.Thread(target=fetch_description, args=(tracker_id, cropped.copy()), daemon=True).start()
+                            threading.Thread(
+                                target=fetch_description, 
+                                args=(tracker_id, class_name, cropped.copy(), base_event_dict), 
+                                daemon=True
+                            ).start()
 
-                labels.append(f"#{tracker_id} {class_name} {confidence}")
+                label = f"#{tracker_id} {class_name} {confidence}"
+                if tracker_id in track_memory and "description" in track_memory[tracker_id]:
+                    # Limit the length of the overlay description to keep it visually clean
+                    desc_text = track_memory[tracker_id]["description"]
+                    label += f" | {desc_text}"
+                labels.append(label)
 
-            # Annotate
-            annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
-            annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
-            
-            # Save the frame if there are events
-            if len(events_to_send) > 0:
-                cv2.imwrite(events_to_send[0]["frame_path"], annotated_frame)
-                # Since all events in this frame share the same visual moment, they can all point to the same frame.
-                for ev in events_to_send:
-                    ev["frame_path"] = events_to_send[0]["frame_path"]
-
-            # Fire off events
-            for event_dict in events_to_send:
-                try:
-                    threading.Thread(target=lambda e=event_dict: asyncio.run(send_event(e)), daemon=True).start()
-                except Exception as e:
-                    pass
-
-            # Annotate
             annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
             annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
         
-        # We always draw the zones
-            cv2.imshow("SemanticEdge 5G", annotated_frame)
+        cv2.imshow("SemanticEdge 5G", annotated_frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
